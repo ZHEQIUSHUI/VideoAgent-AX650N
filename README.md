@@ -12,6 +12,9 @@
 
 基于 AX650N 芯片平台构建的多模态 VideoAgent，融合 **ASR 语音识别 + VLM 视觉描述 + 多模态向量检索 + LLM 问答**，面向长视频的智能索引、跨模态检索与自然语言问答。专为 **AX650N 边缘 AI 芯片**优化，可在边缘设备上实现完整的视频理解与智能问答。
 
+
+[观看演示视频](https://github.com/user-attachments/assets/41ab57cb-63b8-4692-ae52-4f51f84f0145)
+
 ---
 
 ## 目录
@@ -306,8 +309,6 @@ print(result)
 <video controls src="assets/sanguo.mp4" title="三国演义示例视频"></video>
 
 ### 使用步骤
-
-[观看演示视频](https://github.com/user-attachments/assets/41ab57cb-63b8-4692-ae52-4f51f84f0145)
 
 **1. 在 AX650N 芯片上启动相关服务**
 
