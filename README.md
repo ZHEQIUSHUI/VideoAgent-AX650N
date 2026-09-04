@@ -377,6 +377,3 @@ Tokenizer 服务
 
 ---
 
-## 参考项目
-
-- 香港大学数据科学实验室（HKUDS）— [VideoRAG](https://github.com/HKUDS/VideoRAG)：超长视频跨模态检索增强生成框架
