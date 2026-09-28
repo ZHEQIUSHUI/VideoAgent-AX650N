@@ -2,9 +2,11 @@
 import os
 from dataclasses import dataclass, field
 
-from dotenv import load_dotenv
-
-load_dotenv()
+try:  # optional: plain environment variables work too
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 
 def _env(key: str, default: str = "") -> str:

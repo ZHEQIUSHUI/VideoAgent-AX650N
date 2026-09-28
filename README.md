@@ -185,10 +185,14 @@ axllm serve /path/to/Qwen3-VL-2B-Instruct-GPTQ-Int4 --port 8011
 # axllm serve /path/to/Qwen3-VL-Embedding-2B-AX650-C128_P1280_CTX1407 --port 8010
 # axllm serve /path/to/Qwen3-1.7B --port 8012
 
-# ASR（pyaxengine，板端和 AXCL 通用；AXCL 用 AXCL_DEVICE_ID 选卡）
+# ASR（pyaxengine，板端和 AXCL 通用；只依赖 numpy / pyaxengine / kaldi-native-fbank，AXCL 用 AXCL_DEVICE_ID 选卡）
 pip install -r servers/requirements-asr.txt
-SENSEVOICE_DIR=/path/to/SenseVoice python servers/sensevoice_asr_server.py --port 8013
+SENSEVOICE_DIR=/path/to/SenseVoice python3 servers/sensevoice_asr_server.py --port 8013
 ```
+
+> 先启动 VLM，等它加载完再启动 ASR：两者同时加载时，axllm 的 mem-guard 会把 ASR 占用的 CMM 算进 VLM 的每层开销，误判空间不足而中止加载。
+
+板端实测（AX650N 开发板，CMM 4.6 GB，只跑 VLM + ASR，占 2.9 GB）：3 分钟视频索引 4 分 19 秒；「描述这段画面」8 秒，具体问题 14～15 秒。
 
 单卡实测（AXCL，3 分钟视频，VLM + Embedding + ASR 同卡）：索引 7 分 42 秒；「描述这段画面」约 10 秒，具体问题约 10 秒（无 Embedding）/ 25～30 秒（有 Embedding，含 VLM 重看最佳片段）。
 
