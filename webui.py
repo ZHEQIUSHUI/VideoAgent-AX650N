@@ -322,7 +322,9 @@ class Process:
                             for it in self.hits["items"])
             note = ("绿框 = 进入回答的片段" if self.hits["used"]
                     else "概括类问题 / 无高相关片段 → 改为整合全部片段")
-            out.append(self._step("多模态检索（文本 + 画面向量）", "done",
+            title = ("章节路由（无 embedding：由模型读章节摘要定位）" if self.hits.get("routed")
+                     else "多模态检索（文本 + 画面向量）")
+            out.append(self._step(title, "done",
                                   f'<div class="va-muted">阈值 {thr}，{note}</div><div class="va-grid">{cards}</div>'))
         if mode == "retrieve" and self.refined:
             cards = "".join(card(it) for it in self.refined)
@@ -485,6 +487,8 @@ def build(agent: VideoAgent) -> gr.Blocks:
     def status_json(force=False):
         if force:
             for m in (agent.llm, agent.vlm, agent.embedder):
+                if m is None:
+                    continue
                 try:
                     m.refresh_limits()
                 except Exception as e:

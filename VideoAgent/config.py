@@ -40,7 +40,8 @@ class Settings:
     working_dir: str = field(default_factory=lambda: _env("VIDEOAGENT_WORKING_DIR", "./working_dir"))
 
     llm: Endpoint = field(default_factory=lambda: Endpoint(
-        base_url=_env("LLM_API_BASE_URL", "http://127.0.0.1:8012/v1"),
+        # single AX650 card: leave empty and the VLM also acts as the LLM (saves ~2.2 GB CMM)
+        base_url=_env("LLM_API_BASE_URL") or _env("VLM_API_BASE_URL", "http://127.0.0.1:8011/v1"),
         model=_env("LLM_MODEL_NAME"),
         api_key=_env("LLM_API_KEY", "EMPTY"),
         max_prefill=_env_int("LLM_MAX_PREFILL_TOKENS", 0),
@@ -54,7 +55,8 @@ class Settings:
         max_context=_env_int("VLM_MAX_CONTEXT_TOKENS", 0),
     ))
     embedding: Endpoint = field(default_factory=lambda: Endpoint(
-        base_url=_env("EMBEDDING_API_BASE_URL", "http://127.0.0.1:8010/v1"),
+        # optional: empty -> no vector retrieval, questions are routed via chapter summaries
+        base_url=_env("EMBEDDING_API_BASE_URL"),
         model=_env("EMBEDDING_MODEL_NAME"),
         api_key=_env("EMBEDDING_API_KEY", "EMPTY"),
         max_prefill=_env_int("EMBEDDING_MAX_PREFILL_TOKENS", 0),

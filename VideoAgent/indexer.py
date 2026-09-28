@@ -27,8 +27,21 @@ _TRANSCRIPT_TOKENS = 200   # transcript share of the caption prompt
 _THINK_RE = re.compile(r"<think>.*?</think>|</?think>", re.S)
 
 
+_REPEAT_RE = re.compile(r"(.{4,40}?)\1{3,}$", re.S)
+
+
+def repetition_cut(text: str) -> str | None:
+    """If `text` ends with a phrase repeated 4+ times (greedy small models loop), drop the repeats."""
+    m = _REPEAT_RE.search(text[-400:])
+    if not m:
+        return None
+    return text[: len(text) - len(m.group(0)) + len(m.group(1))].rstrip("，、, ") + "……"
+
+
 def clean_text(text: str) -> str:
-    return _THINK_RE.sub("", text or "").strip()
+    text = _THINK_RE.sub("", text or "").strip()
+    cut = repetition_cut(text)
+    return cut if cut is not None else text
 
 
 def fingerprint(path: str) -> str:
@@ -146,6 +159,9 @@ class Indexer:
 
     def _embed(self, seg: Segment) -> tuple[np.ndarray, np.ndarray]:
         emb = self.a.embedder
+        if emb is None:
+            z = np.zeros(1, np.float32)
+            return z, z
         text = f"{seg.caption}\n{seg.transcript}".strip() or "(empty)"
         t = emb.embed_text(text, self.a.counter)
         frames = _even_pick(seg.frames, emb.max_images(len(seg.frames))) if seg.frames else []

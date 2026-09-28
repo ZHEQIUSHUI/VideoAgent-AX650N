@@ -54,6 +54,7 @@ class ModelLimits:
     max_context: int
     source: str             # "server" | "env" | "probe" | "default"
     image_tokens: int = 0   # tokens one image costs (vision models only, 0 = unknown)
+    vision: bool = False    # /v1/models capabilities.vision
 
 
 class _LimitCache:
@@ -179,7 +180,8 @@ class _BaseModel:
         context = context or prefill
 
         image_tokens = cached.get("image_tokens", 0) if cached.get("max_prefill") == prefill else 0
-        limits = ModelLimits(model_id, prefill, max(context, prefill), source, image_tokens)
+        vision = bool((entry.get("capabilities") or {}).get("vision", False))
+        limits = ModelLimits(model_id, prefill, max(context, prefill), source, image_tokens, vision)
         if self.supports_images and not limits.image_tokens:
             try:
                 limits.image_tokens = self._probe_image_tokens(model_id, prefill)
@@ -266,10 +268,11 @@ class ChatModel(_BaseModel):
             "max_tokens": int(max_tokens),
             "stream": stream,
         }
-        if self.thinking_switch:
+        if self.thinking_switch and not self.limits.vision:
             # Qwen3 hybrid LLMs: skip the <think> phase. Never send this to Instruct-only models
-            # (e.g. Qwen3-VL-2B-Instruct): axllm then injects an empty think block the model was not
-            # trained on, and it answers in English or stops at the first token.
+            # (e.g. Qwen3-VL-2B-Instruct, also when the VLM doubles as the LLM on a single card):
+            # axllm then injects an empty think block the model was not trained on, and it answers
+            # in English or stops at the first token.
             body["enable_thinking"] = False
         body.update(extra)
         return body

@@ -20,12 +20,15 @@ class VideoAgent:
             self.settings.working_dir = working_dir
         s = self.settings
         self.store = Store(s.working_dir)
-        cache = _LimitCache(os.path.join(self.store.dir, "model_limits.json"))
+        # model limits depend only on the served model, so share the cache across working dirs
+        cache = _LimitCache(os.path.join(os.path.expanduser(os.getenv("VIDEOAGENT_CACHE_DIR", "~/.cache/videoagent")),
+                                         "model_limits.json"))
         self.counter = TokenCounter(s.tokenizer_json)
         self.llm = ChatModel(s.llm, cache, self.counter, "llm", vision=False, timeout=s.request_timeout,
                              thinking_switch=s.llm_disable_thinking)
         self.vlm = ChatModel(s.vlm, cache, self.counter, "vlm", vision=True, timeout=s.request_timeout)
-        self.embedder = EmbeddingModel(s.embedding, cache, timeout=s.request_timeout)
+        self.embedder = (EmbeddingModel(s.embedding, cache, timeout=s.request_timeout)
+                         if s.embedding.base_url else None)
         self.asr = ASRClient(s.asr_url)
         self.indexer = Indexer(self)
         self.engine = QueryEngine(self)
@@ -53,6 +56,12 @@ class VideoAgent:
     def status(self) -> dict:
         out = {}
         for name, m in (("llm", self.llm), ("vlm", self.vlm), ("embedding", self.embedder)):
+            if m is None:
+                out[name] = "(disabled: questions are routed via chapter summaries)"
+                continue
+            if name == "llm" and m.base == self.vlm.base:
+                out[name] = f"(same service as the VLM: {m.base})"
+                continue
             try:
                 out[name] = {"url": m.base, **asdict(m.limits)}
             except Exception as e:

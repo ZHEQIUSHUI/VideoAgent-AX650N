@@ -17,7 +17,7 @@ import numpy as np
 
 from . import media, prompts
 from .clients import ContextOverflow
-from .indexer import clean_text
+from .indexer import clean_text, repetition_cut as _repetition_cut
 from .store import Segment
 
 log = logging.getLogger("videoagent")
@@ -76,8 +76,46 @@ class QueryEngine:
         fixed = llm.count(prompts.ANSWER_SYSTEM.format(context="")) + llm.count(query) + 120
         return llm.prompt_budget(self.a.settings.answer_max_tokens) - fixed
 
+    def _route(self, query: str, names: list[str], segs: list[Segment]):
+        """No embedding model: let the LLM pick the relevant chapters, score their segments."""
+        chapters = []
+        for n in names:
+            lv = self.a.store.levels(n)
+            if lv:
+                chapters += [(n, c) for c in lv[0]]
+            else:  # index without chapters: every segment is its own "chapter"
+                chapters += [(n, {"start": x.start, "end": x.end, "text": x.caption})
+                             for x in segs if x.video == n]
+        llm = self.a.llm
+        lines, budget = [], llm.prompt_budget(16) - llm.count(prompts.ROUTE_SYSTEM + query) - 40
+        for i, (n, c) in enumerate(chapters, 1):
+            line = f"[{i}] 「{n}」{media.fmt_time(c['start'])}-{media.fmt_time(c['end'])}：{c['text']}"
+            budget -= llm.count(line)
+            if budget < 0:
+                break
+            lines.append(line)
+        msgs = [{"role": "system", "content": prompts.ROUTE_SYSTEM},
+                {"role": "user", "content": "\n".join(lines) + f"\n\n问题：{query}"}]
+        picked = []
+        try:
+            for m in re.findall(r"\d+", llm.chat(msgs, max_tokens=16)):
+                if 1 <= int(m) <= len(lines) and int(m) - 1 not in picked:
+                    picked.append(int(m) - 1)
+        except Exception as e:
+            log.warning("chapter routing failed: %s", e)
+        score = {}
+        for rank, ci in enumerate(picked[:3]):
+            n, c = chapters[ci]
+            for x in segs:
+                if x.video == n and c["start"] <= x.start < c["end"]:
+                    score.setdefault(x.key, 1.0 - 0.1 * rank)
+        ranked = sorted(((x, score.get(x.key, 0.0)) for x in segs), key=lambda t: (-t[1], t[0].video, t[0].start))
+        return ranked
+
     def _rank(self, query: str, names: list[str], segs: list[Segment]):
         """Hybrid ranking: reciprocal-rank fusion of text and visual cosine similarity."""
+        if self.a.embedder is None:
+            return self._route(query, names, segs)
         q = self.a.embedder.embed_text(query, self.a.counter)
         T, V = self.a.store.vectors(names)
         t, v = T @ q, V @ q
@@ -174,6 +212,13 @@ class QueryEngine:
                           for c in levels[min(lv, len(levels)) - 1]]
             if self._tokens(items) <= budget:
                 return lv, items
+            # slightly too big: trim every chapter evenly rather than falling back to a coarser level
+            per = budget // len(items) - 30
+            if per >= 80:
+                items = [Item(it.video, it.start, it.end, self.a.counter.truncate(it.text, per), thumb=it.thumb)
+                         for it in items]
+                if self._tokens(items) <= budget:
+                    return lv, items
         return None
 
     # --------------------------------------------------------------- main
@@ -202,14 +247,20 @@ class QueryEngine:
             mode, items = "full", all_items
             yield {**plan, "mode": mode}
         else:
-            yield {"type": "status", "text": "检索相关片段..."}
-            ranked = self._rank(query, names, segs)
-            hits = [(seg, sc) for seg, sc in ranked if sc >= s.score_threshold][: s.top_k]
+            routed = self.a.embedder is None
+            if plan["global"] and routed:
+                ranked, hits = [], []  # global question: no need to ask the LLM where to look
+            else:
+                yield {"type": "status", "text": "让模型根据章节摘要定位相关片段..." if routed else "检索相关片段..."}
+                ranked = self._rank(query, names, segs)
+                hits = [(seg, sc) for seg, sc in ranked if sc >= s.score_threshold]
+                hits = hits if routed else hits[: s.top_k]  # routed: whole chapters, the budget trims them
             mode = "summarize" if (plan["global"] or not hits) else "retrieve"
             yield {**plan, "mode": mode}
-            yield {"type": "hits", "threshold": s.score_threshold, "used": mode == "retrieve",
-                   "items": [Item(seg.video, seg.start, seg.end, seg.caption, sc, _thumb(seg)).as_dict()
-                             for seg, sc in ranked[: max(s.top_k, 6)]]}
+            if ranked:
+                yield {"type": "hits", "threshold": s.score_threshold, "used": mode == "retrieve", "routed": routed,
+                       "items": [Item(seg.video, seg.start, seg.end, seg.caption, sc, _thumb(seg)).as_dict()
+                                 for seg, sc in ranked[: max(s.top_k, 6)]]}
             if mode == "summarize":
                 pre = self._levels_for(names, budget)
                 if pre:
@@ -230,7 +281,7 @@ class QueryEngine:
                 items = []
                 for rank, (seg, sc) in enumerate(hits):
                     caption = None
-                    if rank < s.refine_top_n and seg.frames:
+                    if rank < s.refine_top_n and seg.frames and not routed:
                         yield {"type": "status", "text": f"VLM 重新观察片段 {media.fmt_time(seg.start)}-"
                                                          f"{media.fmt_time(seg.end)}..."}
                         try:
@@ -243,9 +294,16 @@ class QueryEngine:
                 items = self._pack(items, budget)
 
         # ---- answer, shrinking the context if the server still says it is too long
+        # global question over chapter summaries: the model only writes the overview, the chapter
+        # list is appended verbatim (small models otherwise copy it slowly and run out of tokens)
+        overview_only = mode == "summarize" and plan["global"] and len(items) > 1
         for attempt in range(4):
             context = "\n\n".join(it.render(i + 1) for i, it in enumerate(items))
-            user = query + (prompts.global_hint([(it.start, it.end) for it in items]) if plan["global"] else "")
+            if overview_only:
+                user, max_new = query + prompts.OVERVIEW_HINT, 200
+            else:
+                user = query + (prompts.global_hint([(it.start, it.end) for it in items]) if plan["global"] else "")
+                max_new = s.answer_max_tokens
             msgs = [{"role": "system", "content": prompts.ANSWER_SYSTEM.format(context=context)},
                     {"role": "user", "content": user}]
             answer = ""
@@ -253,8 +311,14 @@ class QueryEngine:
                 yield {"type": "context", "tokens": self._tokens(items), "budget": budget,
                        "items": [it.as_dict(i + 1) for i, it in enumerate(items)]}
                 yield {"type": "status", "text": f"LLM 生成回答（{len(items)} 条资料）..."}
-                for chunk in self.a.llm.stream(msgs, max_tokens=s.answer_max_tokens):
+                for chunk in self.a.llm.stream(msgs, max_tokens=max_new):
                     answer += chunk
+                    cut = _repetition_cut(answer)
+                    if cut is not None:  # greedy small models loop: stop and drop the repeats
+                        log.warning("repetition detected, stopping generation")
+                        answer = cut
+                        yield {"type": "delta", "text": "", "answer": clean_text(answer)}
+                        break
                     yield {"type": "delta", "text": chunk, "answer": clean_text(answer)}
                 break
             except ContextOverflow:
@@ -265,13 +329,22 @@ class QueryEngine:
                 items = (self._pack(items, budget) if mode == "retrieve"
                          else (yield from self._condense(query, items, budget)))
 
+        if overview_only:
+            answer = clean_text(answer)
+            if not answer.startswith("总述"):
+                answer = "总述：" + answer
+            tail = "".join(f"\n\n[{i}] {media.fmt_time(it.start)}-{media.fmt_time(it.end)}：{it.text}"
+                           for i, it in enumerate(items, 1))
+            answer += tail
+            yield {"type": "delta", "text": tail, "answer": answer}
+
         answer = clean_text(answer)
         cited = []
         for m in _CITE_RE.findall(answer):
             n = int(m)
             if 1 <= n <= len(items) and n not in cited:
                 cited.append(n)
-        if not cited and mode == "retrieve":
+        if not cited and (mode == "retrieve" or overview_only):
             cited = list(range(1, len(items) + 1))
         refs = [items[n - 1].as_dict(n) for n in cited]
         if not answer:

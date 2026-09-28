@@ -91,7 +91,7 @@
 
 - **端侧全栈部署**：ASR / VLM / LLM / Embedding 全部跑在 AX650N（板端或 AXCL 加速卡）。
 - **轻依赖**：客户端只需 `requests / numpy / Pillow / gradio`，不再需要 torch、transformers、Tokenizer 服务和向量数据库。
-- **流水线并行**：ASR、VLM、Embedding、LLM 四个服务通常在不同 NPU 上，索引时按片段流水线并行执行。
+- **单卡优先**：默认只需 VLM + ASR（≈2.4 GB CMM），Embedding / 独立 LLM 可选；多卡部署时各阶段自动流水线并行。
 - **健壮性**：服务忙（429）自动排队重试；上下文溢出自动缩减重试；小模型偶发空回答自动换 prompt 重试；错误直接显示在界面上。
 
 ---
@@ -163,23 +163,34 @@ VideoAgent-AX650N/
 |---------|------|------|
 | **ASR** | [SenseVoice](https://huggingface.co/AXERA-TECH/SenseVoice) | 多语言语音识别 |
 | **VLM** | [Qwen3-VL-2B-Instruct-GPTQ-Int4](https://huggingface.co/AXERA-TECH/Qwen3-VL-2B-Instruct-GPTQ-Int4) | 片段画面描述 |
-| **LLM** | [Qwen3-1.7B](https://huggingface.co/AXERA-TECH/Qwen3-1.7B) | 章节摘要与回答 |
-| **Embedding** | [Qwen3-VL-Embedding-2B-AX650](https://huggingface.co/AXERA-TECH/Qwen3-VL-Embedding-2B-AX650-C128_P1280_CTX1407) | 文本/画面统一向量，2048 维 |
+| **LLM**（可选） | [Qwen3-1.7B](https://huggingface.co/AXERA-TECH/Qwen3-1.7B) | 不配置时由 VLM 兼任 |
+| **Embedding**（可选） | [Qwen3-VL-Embedding-2B-AX650](https://huggingface.co/AXERA-TECH/Qwen3-VL-Embedding-2B-AX650-C128_P1280_CTX1407) | 文本/画面统一向量，2048 维 |
 
 ### 2. 启动模型服务
 
 需要较新的 [axllm](https://github.com/AXERA-TECH/ax-llm)（`/v1/models` 会返回 `prefill_max_token_num` / `max_token_len`；旧版本也能用，首次启动时会自动测一次上限并缓存）。
 
+**单卡（默认，一颗 AX650 / 一张 AXCL 卡）**：只需要 VLM + ASR，VLM 同时承担 LLM 的工作。
+
+| 组合 | CMM | 说明 |
+|------|-----|------|
+| VLM + ASR（默认） | ≈ 2.4 GB | 具体问题由模型读章节摘要定位片段 |
+| + Embedding | ≈ 5.1 GB | 增加文本/画面向量检索（画面向量能找到描述里漏掉的视觉细节） |
+| + 独立 LLM（Qwen3-1.7B） | +2.2 GB | 回答窗口更大（prefill 2176 vs 1280）；四个模型合计 7.3 GB，单卡放不下 |
+
 ```bash
 # 板端 AX650；AXCL 加速卡用 AXLLM_DEVICES=<卡号> 指定卡
-axllm serve /path/to/Qwen3-VL-Embedding-2B-AX650-C128_P1280_CTX1407 --port 8010
-axllm serve /path/to/Qwen3-VL-2B-Instruct-GPTQ-Int4               --port 8011
-axllm serve /path/to/Qwen3-1.7B                                   --port 8012
+axllm serve /path/to/Qwen3-VL-2B-Instruct-GPTQ-Int4 --port 8011
+# 可选
+# axllm serve /path/to/Qwen3-VL-Embedding-2B-AX650-C128_P1280_CTX1407 --port 8010
+# axllm serve /path/to/Qwen3-1.7B --port 8012
 
 # ASR（pyaxengine，板端和 AXCL 通用；AXCL 用 AXCL_DEVICE_ID 选卡）
 pip install -r servers/requirements-asr.txt
 SENSEVOICE_DIR=/path/to/SenseVoice python servers/sensevoice_asr_server.py --port 8013
 ```
+
+单卡实测（AXCL，3 分钟视频，VLM + Embedding + ASR 同卡）：索引 7 分 42 秒；「描述这段画面」约 10 秒，具体问题约 10 秒（无 Embedding）/ 25～30 秒（有 Embedding，含 VLM 重看最佳片段）。
 
 ### 3. 安装与配置
 
@@ -291,7 +302,7 @@ ASR 服务
 
 ### Q: 索引很慢，如何加速？
 
-耗时主要在 VLM 画面描述（每段一次）。可以增大 `VIDEOAGENT_SEGMENT_SECONDS`、减小 `VIDEOAGENT_MAX_FRAMES_PER_SEGMENT` 或 `VIDEOAGENT_CAPTION_MAX_TOKENS`。四个服务放在不同 NPU / 加速卡上时，ASR、VLM、Embedding、LLM 会流水线并行。
+耗时主要在 VLM 画面描述（每段一次，单卡约 14 秒）。可以增大 `VIDEOAGENT_SEGMENT_SECONDS`、减小 `VIDEOAGENT_MAX_FRAMES_PER_SEGMENT` 或 `VIDEOAGENT_CAPTION_MAX_TOKENS`；不配 Embedding 也能省掉每段的向量编码。
 
 ### Q: 回答慢？
 
