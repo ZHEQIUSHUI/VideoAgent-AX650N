@@ -1,0 +1,9 @@
+# SenseVoice ASR server (servers/sensevoice_asr_server.py)
+fastapi
+uvicorn
+python-multipart
+librosa
+soxr
+kaldi-native-fbank
+torch                # SenseVoiceAx.py imports it (CPU build is enough)
+# pyaxengine: https://github.com/AXERA-TECH/pyaxengine/releases
