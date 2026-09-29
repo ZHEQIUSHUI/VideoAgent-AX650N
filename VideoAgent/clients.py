@@ -40,7 +40,7 @@ class ContextOverflow(ModelError):
     """The prompt does not fit into the model's prefill / context window."""
 
 
-_OVERFLOW_HINTS = ("长度上限", "context", "too long", "exceed", "prefill", "max_token")
+_OVERFLOW_HINTS = ("长度上限", "context", "too long", "exceed", "prefill", "max_token", "input too")
 
 
 def _raise_for_error(err, status: int = 0):
@@ -398,7 +398,7 @@ class EmbeddingModel(_BaseModel):
         try:
             r = self._post("/embeddings", body, timeout=min(self.timeout, 120))
         except requests.Timeout:
-            raise ContextOverflow("embedding request timed out (axllm hangs when the input is too long)")
+            raise ContextOverflow("embedding request timed out (input probably too long)")
         try:
             data = r.json()
         except ValueError:
@@ -447,8 +447,9 @@ class EmbeddingModel(_BaseModel):
                     raise
                 imgs = imgs[:: 2] if len(imgs) > 2 else imgs[:1]
 
-    # axllm's /embeddings does not reject an oversized input: the request hangs until the server
-    # timeout (5 min). So never probe it — use conservative defaults when the server reports nothing.
+    # axllm before b704e2f answers an oversized /embeddings input with a bare "504 Request timeout"
+    # (no reason), indistinguishable from a busy server, so never probe it — use conservative
+    # defaults when the server reports nothing (newer axllm reports its limits anyway).
     DEFAULT_PREFILL = 1024
     DEFAULT_IMAGE_TOKENS = 160   # Qwen3-VL-Embedding 384x384 vision encoder: 144 + markers
 
