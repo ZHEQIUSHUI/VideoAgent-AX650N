@@ -27,6 +27,9 @@ log = logging.getLogger("videoagent")
 _MSG_OVERHEAD = 6
 _PROMPT_OVERHEAD = 8
 _SAFETY = 0.94
+_PROBE_VERSION = 2          # bump to invalidate limits measured by an older (buggy) probe
+_MAX_SANE_PREFILL = 32768   # AX650 LLM/VLM builds are far below this
+_PROBE_TIMEOUT = 60         # a probe request that takes longer counts as "does not fit"
 
 
 class ModelError(RuntimeError):
@@ -127,12 +130,13 @@ class _BaseModel:
             self._limits = self._resolve_limits(force_probe=force_probe)
         return self._limits
 
-    def _post(self, path: str, body: dict, stream: bool = False) -> requests.Response:
+    def _post(self, path: str, body: dict, stream: bool = False, timeout: float | None = None) -> requests.Response:
         """POST that waits while the server is busy (axllm serve answers 429 when its queue is full)."""
-        deadline = time.time() + self.timeout
+        timeout = timeout or self.timeout
+        deadline = time.time() + timeout
         delay = 0.5
         while True:
-            r = self.session.post(f"{self.base}{path}", json=body, stream=stream, timeout=self.timeout)
+            r = self.session.post(f"{self.base}{path}", json=body, stream=stream, timeout=timeout)
             if r.status_code not in (429, 503) or time.time() > deadline:
                 return r
             r.close()
@@ -169,29 +173,37 @@ class _BaseModel:
             prefill, source = self.ep.max_prefill, "env"
         if self.ep.max_context:
             context = self.ep.max_context
-        if not prefill and not force_probe and cached.get("max_prefill"):
+        cached_ok = (cached.get("max_prefill") and 0 < cached["max_prefill"] <= _MAX_SANE_PREFILL
+                     and (cached.get("source") != "probe" or cached.get("probe_version") == _PROBE_VERSION))
+        if not prefill and not force_probe and cached_ok:
             prefill, source = cached["max_prefill"], cached.get("source", "probe")
             context = context or cached.get("max_context", 0)
         if not prefill:
-            log.warning("%s server does not report its prefill limit, measuring it once...", self.kind)
-            prefill, measured_ctx = self._probe_prefill(model_id)
-            source = "probe"
+            prefill, measured_ctx, source = self._unknown_prefill(model_id)
             context = context or measured_ctx
         context = context or prefill
 
-        image_tokens = cached.get("image_tokens", 0) if cached.get("max_prefill") == prefill else 0
-        vision = bool((entry.get("capabilities") or {}).get("vision", False))
+        image_tokens = cached.get("image_tokens", 0) if cached_ok and cached.get("max_prefill") == prefill else 0
+        # old axllm reports no capabilities: fall back to the model name (Qwen3-VL-..., InternVL, ...)
+        vision = bool((entry.get("capabilities") or {}).get("vision",
+                                                           re.search(r"VL|vision|omni", model_id, re.I) is not None))
         limits = ModelLimits(model_id, prefill, max(context, prefill), source, image_tokens, vision)
         if self.supports_images and not limits.image_tokens:
             try:
                 limits.image_tokens = self._probe_image_tokens(model_id, prefill)
             except Exception as e:
                 log.warning("%s image token probe failed (%s), assuming 256 for now", self.kind, e)
-                self.cache.put(key, asdict(limits))  # cache without the guess, re-probe next start
+                self.cache.put(key, {**asdict(limits), "probe_version": _PROBE_VERSION})  # no guess: re-probe
                 limits.image_tokens = 256
                 return limits
-        self.cache.put(key, asdict(limits))
+        self.cache.put(key, {**asdict(limits), "probe_version": _PROBE_VERSION})
         return limits
+
+    def _unknown_prefill(self, model_id: str) -> tuple[int, int, str]:
+        """The server does not report its limits (axllm before 2026-09): measure them once."""
+        log.warning("%s server does not report its prefill limit (old axllm?), measuring it once...", self.kind)
+        prefill, ctx = self._probe_prefill(model_id)
+        return prefill, ctx, "probe"
 
     supports_images = False
 
@@ -199,38 +211,32 @@ class _BaseModel:
         """Send a prompt of ~n tokens. Returns prompt tokens used, raises on failure."""
         raise NotImplementedError
 
+    def _fits(self, model_id: str, n: int) -> bool:
+        try:
+            self._try_prompt(model_id, n)
+            return True
+        except (ModelError, requests.RequestException):
+            return False
+
     def _probe_prefill(self, model_id: str) -> tuple[int, int]:
-        lo, hi = 0, 0
-        n = 512
-        # grow until failure (failures are cheap: the server rejects before prefill)
-        while n <= 65536:
-            try:
-                self._try_prompt(model_id, n)
-                lo = n
-                n *= 2
-            except ModelError:
+        """Largest prompt the server accepts. Only a *verified* answer counts as success: old axllm
+        builds return an empty 200 instead of an error when the prompt does not fit."""
+        lo, hi, n = 0, 0, 256
+        while n <= _MAX_SANE_PREFILL:
+            if self._fits(model_id, n):
+                lo, n = n, n * 2
+            else:
                 hi = n
                 break
-        if not hi:
-            return lo, lo
         if not lo:
-            n = 64
-            while n < hi:
-                try:
-                    self._try_prompt(model_id, n)
-                    lo = n
-                    break
-                except ModelError:
-                    n *= 2
-            if not lo:
-                raise ModelError(f"{self.kind}: even a {n}-token prompt fails")
+            raise ModelError(f"{self.kind}: even a {n}-token prompt fails; set {self.kind.upper()}_MAX_PREFILL_TOKENS")
+        if not hi:
+            log.warning("%s accepted %d tokens, capping the limit there", self.kind, lo)
+            return lo, lo
         while hi - lo > 32:
             mid = (lo + hi) // 2
-            try:
-                self._try_prompt(model_id, mid)
-                lo = mid
-            except ModelError:
-                hi = mid
+            lo, hi = (mid, hi) if self._fits(model_id, mid) else (lo, mid)
+        log.info("%s measured prefill limit ≈ %d tokens", self.kind, lo + _PROMPT_OVERHEAD)
         # lo counts digits only; the whole prompt is a bit longer
         return lo + _PROMPT_OVERHEAD, lo + _PROMPT_OVERHEAD
 
@@ -349,18 +355,25 @@ class ChatModel(_BaseModel):
     # ---------------------------------------------------------------- probes
     def _try_prompt(self, model_id: str, n_tokens: int) -> int:
         msgs = [{"role": "user", "content": _digits(n_tokens)}]
-        r = self._post("/chat/completions", self._body(msgs, 1, False, model_id))
+        r = self._post("/chat/completions", self._body(msgs, 2, False, model_id), timeout=_PROBE_TIMEOUT)
         data = r.json()
         if r.status_code >= 400 or "error" in data:
             _raise_for_error(data.get("error", data), r.status_code)
-        return int((data.get("usage") or {}).get("prompt_tokens") or n_tokens)
+        content = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        used = int((data.get("usage") or {}).get("prompt_tokens") or 0)
+        if not content.strip():
+            raise ModelError("empty answer (prompt silently rejected)")
+        if used and used < n_tokens:
+            raise ModelError(f"only {used} of {n_tokens} prompt tokens were processed")
+        return used or n_tokens
 
     def _probe_image_tokens(self, model_id: str, max_prefill: int) -> int:
         from PIL import Image
         img = jpeg_b64(Image.new("RGB", (64, 64), (128, 128, 128)))
 
         def usage(content):
-            r = self._post("/chat/completions", self._body([{"role": "user", "content": content}], 1, False, model_id))
+            r = self._post("/chat/completions", self._body([{"role": "user", "content": content}], 1, False, model_id),
+                           timeout=_PROBE_TIMEOUT)
             data = r.json()
             if r.status_code >= 400 or "error" in data:
                 _raise_for_error(data.get("error", data), r.status_code)
@@ -382,7 +395,10 @@ class EmbeddingModel(_BaseModel):
     def _embed_request(self, messages, model_id=None) -> dict:
         body = {"model": model_id or self.model, "messages": messages, "encoding_format": "float",
                 "add_special_tokens": True}
-        r = self._post("/embeddings", body)
+        try:
+            r = self._post("/embeddings", body, timeout=min(self.timeout, 120))
+        except requests.Timeout:
+            raise ContextOverflow("embedding request timed out (axllm hangs when the input is too long)")
         try:
             data = r.json()
         except ValueError:
@@ -431,31 +447,18 @@ class EmbeddingModel(_BaseModel):
                     raise
                 imgs = imgs[:: 2] if len(imgs) > 2 else imgs[:1]
 
-    def _try_prompt(self, model_id: str, n_tokens: int) -> int:
-        self._embed_request(self._messages([{"type": "text", "text": _digits(n_tokens)}]), model_id)
-        return n_tokens
+    # axllm's /embeddings does not reject an oversized input: the request hangs until the server
+    # timeout (5 min). So never probe it — use conservative defaults when the server reports nothing.
+    DEFAULT_PREFILL = 1024
+    DEFAULT_IMAGE_TOKENS = 160   # Qwen3-VL-Embedding 384x384 vision encoder: 144 + markers
+
+    def _unknown_prefill(self, model_id: str) -> tuple[int, int, str]:
+        log.warning("embedding server does not report its prefill limit (old axllm?), assuming %d tokens "
+                    "(set EMBEDDING_MAX_PREFILL_TOKENS to override)", self.DEFAULT_PREFILL)
+        return self.DEFAULT_PREFILL, self.DEFAULT_PREFILL, "default"
 
     def _probe_image_tokens(self, model_id: str, max_prefill: int) -> int:
-        from PIL import Image
-        item = {"type": "image", "image": "data:image/jpeg;base64," +
-                jpeg_b64(Image.new("RGB", (64, 64), (128, 128, 128)))}
-        data = self._embed_request(self._messages([item]), model_id)
-        used = int((data.get("usage") or {}).get("prompt_tokens") or 0)
-        if used:
-            text_only = int((self._embed_request(self._messages([{"type": "text", "text": "hi"}]), model_id)
-                             .get("usage") or {}).get("prompt_tokens") or 0)
-            if 0 < text_only < used:
-                return used - text_only
-        # no usage reported: find how many images fit, the per-image cost follows from that
-        lo, hi = 1, 64
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            try:
-                self._embed_request(self._messages([item] * mid), model_id)
-                lo = mid
-            except ModelError:
-                hi = mid - 1
-        return max(1, (max_prefill - 32) // lo)
+        return int(os.getenv("EMBEDDING_IMAGE_TOKENS", self.DEFAULT_IMAGE_TOKENS))
 
 
 class PerceptionClient:

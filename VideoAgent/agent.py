@@ -25,7 +25,9 @@ class VideoAgent:
                                          "model_limits.json"))
         self.counter = TokenCounter(s.tokenizer_json)
         self.llm = ChatModel(s.llm, cache, self.counter, "llm", vision=False, timeout=s.request_timeout,
-                             thinking_switch=s.llm_disable_thinking)
+                             # never when the VLM doubles as the LLM (Instruct VLMs break on enable_thinking)
+                             thinking_switch=s.llm_disable_thinking and
+                             s.llm.base_url.rstrip("/") != s.vlm.base_url.rstrip("/"))
         self.vlm = ChatModel(s.vlm, cache, self.counter, "vlm", vision=True, timeout=s.request_timeout)
         self.embedder = (EmbeddingModel(s.embedding, cache, timeout=s.request_timeout)
                          if s.embedding.base_url else None)
