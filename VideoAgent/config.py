@@ -66,8 +66,9 @@ class Settings:
     ))
     # send enable_thinking=false to the LLM (Qwen3 hybrid-thinking models); never sent to the VLM
     llm_disable_thinking: bool = field(default_factory=lambda: _env("LLM_DISABLE_THINKING", "1") not in ("0", "false"))
-    # SenseVoice ASR server (POST /asr/file). Empty -> index without speech.
-    asr_url: str = field(default_factory=lambda: _env("ASR_API_BASE_URL", _env("SHERPA_ASR_URL", "")))
+    # servers/perception_server.py: SenseVoice ASR + PP-OCR. Empty -> index without speech / on-screen text.
+    perception_url: str = field(default_factory=lambda: _env("PERCEPTION_API_BASE_URL",
+                                                             _env("ASR_API_BASE_URL", _env("SHERPA_ASR_URL", ""))))
 
     # Optional HF tokenizer.json for exact token counting (needs `pip install tokenizers`).
     # Without it a calibrated estimate is used, which is fine thanks to overflow retries.
@@ -76,7 +77,9 @@ class Settings:
     # --- indexing ---
     segment_seconds: int = field(default_factory=lambda: _env_int("VIDEOAGENT_SEGMENT_SECONDS", 10))
     max_frames_per_segment: int = field(default_factory=lambda: _env_int("VIDEOAGENT_MAX_FRAMES_PER_SEGMENT", 5))
-    frame_max_side: int = field(default_factory=lambda: _env_int("VIDEOAGENT_FRAME_MAX_SIDE", 448))
+    # frames are kept large enough for OCR to read shop signs / subtitles (the VLM resizes them itself)
+    frame_max_side: int = field(default_factory=lambda: _env_int("VIDEOAGENT_FRAME_MAX_SIDE", 1280))
+    ocr_frames_per_segment: int = field(default_factory=lambda: _env_int("VIDEOAGENT_OCR_FRAMES_PER_SEGMENT", 2))
     caption_max_tokens: int = field(default_factory=lambda: _env_int("VIDEOAGENT_CAPTION_MAX_TOKENS", 256))
     # chapter summaries built while indexing (answer "describe the whole video" without a query-time map-reduce)
     chapter_max_segments: int = field(default_factory=lambda: _env_int("VIDEOAGENT_CHAPTER_MAX_SEGMENTS", 6))

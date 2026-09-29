@@ -301,6 +301,21 @@ class ChatModel(_BaseModel):
             self._calibrate(messages, data.get("usage"))
         return (data["choices"][0]["message"].get("content") or "").strip()
 
+    def generate(self, messages, max_tokens: int = 256, stop_on_repeat=None, **extra) -> str:
+        """Streamed generation that stops as soon as `stop_on_repeat(text)` returns a trimmed text
+        (small greedy models loop until max_tokens otherwise)."""
+        out = ""
+        for chunk in self.stream(messages, max_tokens=max_tokens, **extra):
+            out += chunk
+            if stop_on_repeat is not None and len(out) > 60:
+                cut = stop_on_repeat(out)
+                if cut is not None:
+                    log.info("%s: repetition, generation stopped early", self.kind)
+                    return cut
+        if not out.strip():
+            raise ModelError("empty model response")
+        return out
+
     def stream(self, messages, max_tokens: int = 512, **extra):
         """Yield text deltas. Raises ContextOverflow / ModelError (also mid-stream)."""
         with self._post("/chat/completions", self._body(messages, max_tokens, True, **extra), stream=True) as r:
@@ -443,24 +458,37 @@ class EmbeddingModel(_BaseModel):
         return max(1, (max_prefill - 32) // lo)
 
 
-class ASRClient:
-    """SenseVoice ASR server: POST /asr/file (multipart) -> {"text": ...}."""
+class PerceptionClient:
+    """servers/perception_server.py (or the legacy sherpa ASR server): /asr/file, /ocr, /health."""
 
     _TAG_RE = re.compile(r"<\|[^|]*\|>")
 
     def __init__(self, base_url: str, timeout: float = 120):
-        self.base = base_url.rstrip("/")
+        self.base = (base_url or "").rstrip("/")
         self.timeout = timeout
+        self._caps = None
+
+    def capabilities(self) -> dict:
+        """{"asr": bool, "ocr": bool} from /health (legacy ASR-only servers report no "ocr")."""
+        if self._caps is None:
+            caps = {"asr": False, "ocr": False}
+            if self.base:
+                try:
+                    h = requests.get(f"{self.base}/health", timeout=5).json()
+                    caps = {"asr": bool(h.get("asr", h.get("model_loaded", True))), "ocr": bool(h.get("ocr", False))}
+                except Exception as e:
+                    log.warning("perception server %s unreachable: %s", self.base, e)
+                    return caps  # not cached: retry next time
+            self._caps = caps
+        return self._caps
 
     @property
-    def enabled(self) -> bool:
-        return bool(self.base)
+    def asr_enabled(self) -> bool:
+        return self.capabilities()["asr"]
 
-    def health(self) -> bool:
-        try:
-            return requests.get(f"{self.base}/health", timeout=5).ok
-        except Exception:
-            return False
+    @property
+    def ocr_enabled(self) -> bool:
+        return self.capabilities()["ocr"]
 
     def transcribe(self, wav_path: str) -> str:
         with open(wav_path, "rb") as f:
@@ -469,6 +497,14 @@ class ASRClient:
             raise ModelError(f"ASR HTTP {r.status_code}: {r.text[:200]}")
         text = self._TAG_RE.sub("", r.json().get("text", ""))
         return re.sub(r"\s+", " ", text).strip()
+
+    def ocr(self, image_path: str) -> list[dict]:
+        with open(image_path, "rb") as f:
+            r = requests.post(f"{self.base}/ocr", data=f.read(), timeout=self.timeout,
+                              headers={"Content-Type": "application/octet-stream"})
+        if r.status_code != 200:
+            raise ModelError(f"OCR HTTP {r.status_code}: {r.text[:200]}")
+        return r.json().get("texts", [])
 
 
 def wait_ready(models, timeout: float = 0):

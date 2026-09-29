@@ -3,7 +3,7 @@ import logging
 import os
 from dataclasses import asdict
 
-from .clients import ASRClient, ChatModel, EmbeddingModel, _LimitCache
+from .clients import ChatModel, EmbeddingModel, PerceptionClient, _LimitCache
 from .config import Settings
 from .indexer import Indexer
 from .query import QueryEngine
@@ -29,7 +29,7 @@ class VideoAgent:
         self.vlm = ChatModel(s.vlm, cache, self.counter, "vlm", vision=True, timeout=s.request_timeout)
         self.embedder = (EmbeddingModel(s.embedding, cache, timeout=s.request_timeout)
                          if s.embedding.base_url else None)
-        self.asr = ASRClient(s.asr_url)
+        self.perception = PerceptionClient(s.perception_url)
         self.indexer = Indexer(self)
         self.engine = QueryEngine(self)
 
@@ -66,8 +66,7 @@ class VideoAgent:
                 out[name] = {"url": m.base, **asdict(m.limits)}
             except Exception as e:
                 out[name] = {"url": m.base, "error": str(e)}
-        out["asr"] = {"url": self.asr.base or "(disabled)",
-                      "ok": self.asr.health() if self.asr.enabled else None}
+        out["perception"] = {"url": self.perception.base or "(disabled)", **self.perception.capabilities()}
         out["token_counter"] = "exact (tokenizer.json)" if self.counter.exact else "estimate + auto-calibration"
         out["videos"] = self.store.names()
         return out

@@ -80,17 +80,17 @@
 
 ### 🚀 功能特性
 
-- **视频智能索引**：自动分段、语音识别、画面描述、多模态向量化；边描述边生成**章节摘要**，一键完成长视频入库。
+- **视频智能索引**：自动分段，每段**看画面**（VLM 描述）、**听声音**（SenseVoice）、**读文字**（PP-OCR 识别招牌、字幕、菜单）；边看边生成**章节摘要**。
 - **上下文自适应**：自动读取各模型服务的 **prefill 上限**，据此决定每段抽几帧、一次能放多少资料、何时分段整合，不会再因为 prompt 超长而"没反应"。
-- **三种回答策略**：内容放得下就全量通读；具体问题走多模态检索 + VLM 带着问题重新观察；「描述/概括这段视频」这类全局问题使用分层章节摘要（map-reduce）。
-- **全过程可视化**：索引时像"跟着 AI 一起看视频"，播放窗口轮播正在分析的帧，时间轴逐段点亮；提问时逐步展示 token 预算、策略、检索命中、章节整合与最终上下文。
+- **多路查找**：问题里的关键词先在画面文字、描述、语音里直接匹配（店名/人名/字幕最准）；匹配不到再由模型读章节摘要定位（或可选的向量检索）；「描述/概括这段视频」直接用章节摘要。
+- **全过程可视化**：索引时像"跟着 AI 一起看视频"——轮播正在分析的帧、逐字写出看到的内容、标出读到的文字、时间轴逐段点亮；提问时用大白话展示查找过程，引用编号可点击直接播放对应片段。
 - **带时间定位的回答**：回答用 [编号] 引用资料，自动导出对应视频片段播放。
 - **增量入库**：按文件指纹去重，已索引视频自动跳过。
 
 ### 🔧 技术特性
 
 - **端侧全栈部署**：ASR / VLM / LLM / Embedding 全部跑在 AX650N（板端或 AXCL 加速卡）。
-- **轻依赖**：客户端只需 `requests / numpy / Pillow / gradio`，不再需要 torch、transformers、Tokenizer 服务和向量数据库。
+- **轻依赖**：客户端只需 `requests / numpy / Pillow`，网页服务用 Python 标准库实现（不需要 gradio），板端出厂系统即可运行。
 - **单卡优先**：默认只需 VLM + ASR（≈2.4 GB CMM），Embedding / 独立 LLM 可选；多卡部署时各阶段自动流水线并行。
 - **健壮性**：服务忙（429）自动排队重试；上下文溢出自动缩减重试；小模型偶发空回答自动换 prompt 重试；错误直接显示在界面上。
 
@@ -147,9 +147,10 @@ VideoAgent-AX650N/
 │   ├── prompts.py      # 提示词
 │   └── __main__.py     # 命令行
 ├── servers/
-│   ├── sensevoice_asr_server.py  # SenseVoice（pyaxengine，板端/AXCL 通用）
+│   ├── perception_server.py      # 感知服务：SenseVoice 语音 + PP-OCR 文字（pyaxengine，板端/AXCL 通用）
 │   └── sherpa_asr_server.py      # SenseVoice（sherpa-onnx，板端 aarch64）
-├── webui.py            # Gradio 界面（过程可视化）
+├── webui.py            # 网页服务（标准库 HTTP + SSE）
+├── web/                # 前端（原生 HTML/CSS/JS）
 └── .env.example
 ```
 
@@ -162,6 +163,7 @@ VideoAgent-AX650N/
 | 模型类型 | 模型 | 说明 |
 |---------|------|------|
 | **ASR** | [SenseVoice](https://huggingface.co/AXERA-TECH/SenseVoice) | 多语言语音识别 |
+| **OCR** | [PPOCR_v6](https://huggingface.co/AXERA-TECH/PPOCR_v6) | 画面文字识别（店招、字幕），约 23 MB |
 | **VLM** | [Qwen3-VL-2B-Instruct-GPTQ-Int4](https://huggingface.co/AXERA-TECH/Qwen3-VL-2B-Instruct-GPTQ-Int4) | 片段画面描述 |
 | **LLM**（可选） | [Qwen3-1.7B](https://huggingface.co/AXERA-TECH/Qwen3-1.7B) | 不配置时由 VLM 兼任 |
 | **Embedding**（可选） | [Qwen3-VL-Embedding-2B-AX650](https://huggingface.co/AXERA-TECH/Qwen3-VL-Embedding-2B-AX650-C128_P1280_CTX1407) | 文本/画面统一向量，2048 维 |
@@ -174,7 +176,7 @@ VideoAgent-AX650N/
 
 | 组合 | CMM | 说明 |
 |------|-----|------|
-| VLM + ASR（默认） | ≈ 2.4 GB | 具体问题由模型读章节摘要定位片段 |
+| VLM + ASR + OCR（默认） | ≈ 2.5 GB | 关键词直接匹配 + 模型读章节摘要定位 |
 | + Embedding | ≈ 5.1 GB | 增加文本/画面向量检索（画面向量能找到描述里漏掉的视觉细节） |
 | + 独立 LLM（Qwen3-1.7B） | +2.2 GB | 回答窗口更大（prefill 2176 vs 1280）；四个模型合计 7.3 GB，单卡放不下 |
 
@@ -185,12 +187,13 @@ axllm serve /path/to/Qwen3-VL-2B-Instruct-GPTQ-Int4 --port 8011
 # axllm serve /path/to/Qwen3-VL-Embedding-2B-AX650-C128_P1280_CTX1407 --port 8010
 # axllm serve /path/to/Qwen3-1.7B --port 8012
 
-# ASR（pyaxengine，板端和 AXCL 通用；只依赖 numpy / pyaxengine / kaldi-native-fbank，AXCL 用 AXCL_DEVICE_ID 选卡）
-pip install -r servers/requirements-asr.txt
-SENSEVOICE_DIR=/path/to/SenseVoice python3 servers/sensevoice_asr_server.py --port 8013
+# 感知服务：语音 + 文字识别（pyaxengine，板端和 AXCL 通用；AXCL 用 AXCL_DEVICE_ID 选卡）
+pip install -r servers/requirements.txt
+python3 servers/perception_server.py --port 8013 \
+    --asr-dir /path/to/SenseVoice --ocr-dir /path/to/PPOCR_v6
 ```
 
-> 先启动 VLM，等它加载完再启动 ASR：两者同时加载时，axllm 的 mem-guard 会把 ASR 占用的 CMM 算进 VLM 的每层开销，误判空间不足而中止加载。
+> 先启动 VLM，等它加载完再启动感知服务：两者同时加载时，axllm 的 mem-guard 会把感知服务占用的 CMM 算进 VLM 的每层开销，误判空间不足而中止加载。
 
 板端实测（AX650N 开发板，CMM 4.6 GB，只跑 VLM + ASR，占 2.9 GB）：3 分钟视频索引 4 分 19 秒；「描述这段画面」8 秒，具体问题 14～15 秒。
 
@@ -217,10 +220,12 @@ python webui.py           # http://localhost:7869
 
 ### Web UI
 
-- **视频索引**：上传视频后可以实时看到 AI 正在观看的片段、逐段生成的描述和转写、时间轴与章节摘要。
-- **智能问答**：右侧「推理过程」面板展示上下文预算条、所选策略、检索命中（带相似度）、VLM 重看结果、章节整合和最终进入上下文的片段；回答下方是引用片段的视频。
-- **已索引视频**：查看每个视频的时间轴、章节摘要和全部片段，可删除索引。
-- **系统状态**：各服务地址、自动读取到的 prefill / 上下文上限、每帧图像 token 数。
+```bash
+python3 webui.py --port 7869     # 浏览器打开 http://<设备IP>:7869
+```
+
+- **视频库**：拖入视频上传后，页面实时展示 AI 逐段观看的过程：正在分析的帧、它写下的画面描述、读到的文字、听到的话，时间轴逐段点亮、章节摘要依次出现。点开已上传的视频可以查看时间轴、章节和每一段的内容，点击任意位置跳转播放。
+- **问视频**：输入问题（可限定在某几个视频里找）。右侧「AI 是怎么找到答案的」一步步说明：提取了哪些关键词、在哪些片段里找到（关键词高亮）、交给 AI 多少资料；左侧是回答和相关片段，回答里的 [编号] 可以点击直接播放。
 
 ### 命令行
 

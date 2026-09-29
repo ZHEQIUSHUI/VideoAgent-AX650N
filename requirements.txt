@@ -1,8 +1,6 @@
 numpy
 requests
-python-dotenv
 Pillow
-gradio>=5
-# optional
-# tokenizers           # exact token counting via TOKENIZER_JSON
-# imageio-ffmpeg       # if the system has no ffmpeg
+python-dotenv   # optional
+# web UI uses only the Python standard library (no gradio)
+# optional: tokenizers (exact token counting via TOKENIZER_JSON), imageio-ffmpeg (if the system has no ffmpeg)

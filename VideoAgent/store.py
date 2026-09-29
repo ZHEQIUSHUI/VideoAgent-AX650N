@@ -22,6 +22,7 @@ class Segment:
     end: float
     caption: str = ""
     transcript: str = ""
+    ocr: str = ""                                   # on-screen text (signs, subtitles) read by OCR
     frames: list[str] = field(default_factory=list)
 
     @property

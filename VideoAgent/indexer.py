@@ -27,12 +27,12 @@ _TRANSCRIPT_TOKENS = 200   # transcript share of the caption prompt
 _THINK_RE = re.compile(r"<think>.*?</think>|</?think>", re.S)
 
 
-_REPEAT_RE = re.compile(r"(.{4,40}?)\1{3,}$", re.S)
+_REPEAT_RE = re.compile(r"(.{4,160}?)\1{2,}$", re.S)
 
 
 def repetition_cut(text: str) -> str | None:
-    """If `text` ends with a phrase repeated 4+ times (greedy small models loop), drop the repeats."""
-    m = _REPEAT_RE.search(text[-400:])
+    """If `text` ends with a phrase repeated 3+ times (greedy small models loop), drop the repeats."""
+    m = _REPEAT_RE.search(text[-1200:])
     if not m:
         return None
     return text[: len(text) - len(m.group(0)) + len(m.group(1))].rstrip("，、, ") + "……"
@@ -42,6 +42,15 @@ def clean_text(text: str) -> str:
     text = _THINK_RE.sub("", text or "").strip()
     cut = repetition_cut(text)
     return cut if cut is not None else text
+
+
+def segment_text(seg: Segment, caption: str | None = None) -> str:
+    """How a segment is presented to the LLM / embedder: caption, on-screen text, speech."""
+    parts = [f"画面：{caption if caption is not None else seg.caption or '（无）'}"]
+    if seg.ocr:
+        parts.append(f"文字：{seg.ocr}")
+    parts.append(f"语音：{seg.transcript or '（无）'}")
+    return "\n".join(parts)
 
 
 def fingerprint(path: str) -> str:
@@ -104,7 +113,7 @@ class Indexer:
 
     # ------------------------------------------------------------- stages
     def _transcribe(self, audio, seg: Segment, tmp_dir: str) -> str:
-        if audio is None or not self.a.asr.enabled:
+        if audio is None or not self.a.perception.asr_enabled:
             return ""
         chunk = audio[int(seg.start * 16000): int(seg.end * 16000)]
         if chunk.size < 1600 or float(np.sqrt(np.mean(chunk ** 2))) < 1e-3:  # <0.1s or silence
@@ -112,12 +121,33 @@ class Indexer:
         wav = os.path.join(tmp_dir, f"{seg.index}.wav")
         media.write_wav(wav, chunk)
         try:
-            return self.a.asr.transcribe(wav)
+            text = self.a.perception.transcribe(wav)
+            return "" if len(re.sub(r"[\W_]+", "", text)) < 2 else text  # "." etc. = no speech
         except Exception as e:
             log.warning("ASR failed for %s: %s", seg.key, e)
             return ""
         finally:
             os.remove(wav)
+
+    def _read_text(self, seg: Segment) -> str:
+        """OCR a few frames of the segment; unique lines in reading order."""
+        if not seg.frames or not self.a.perception.ocr_enabled:
+            return ""
+        lines = []
+        for f in _even_pick(seg.frames, self.a.settings.ocr_frames_per_segment):
+            try:
+                for t in self.a.perception.ocr(f):
+                    text = re.sub(r"\s+", "", t.get("text", ""))
+                    if t.get("score", 0) >= 0.6 and len(text) >= 2 and not any(text in x for x in lines):
+                        lines = [x for x in lines if x not in text] + [text]
+            except Exception as e:
+                log.warning("OCR failed for %s: %s", seg.key, e)
+        return self.a.counter.truncate("；".join(lines), 120)
+
+    def _perceive(self, audio, seg: Segment, tmp_dir: str) -> Segment:
+        seg.transcript = self._transcribe(audio, seg, tmp_dir)
+        seg.ocr = self._read_text(seg)
+        return seg
 
     def caption(self, seg: Segment, frames: list[str], query: str | None = None,
                 max_tokens: int | None = None) -> str:
@@ -128,13 +158,14 @@ class Indexer:
         start, end = media.fmt_time(seg.start), media.fmt_time(seg.end)
         frames = list(frames)
         while True:
-            text = (prompts.refine_prompt(start, end, len(frames), transcript, query) if query
-                    else prompts.caption_prompt(start, end, len(frames), transcript))
+            text = (prompts.refine_prompt(start, end, len(frames), transcript, query, seg.ocr) if query
+                    else prompts.caption_prompt(start, end, len(frames), transcript, seg.ocr))
             content = [{"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{_b64_file(f)}"}}
                        for f in frames]
             content.append({"type": "text", "text": text})
             try:
-                out = clean_text(vlm.chat([{"role": "user", "content": content}], max_tokens=max_tokens))
+                out = clean_text(vlm.generate([{"role": "user", "content": content}], max_tokens=max_tokens,
+                                              stop_on_repeat=repetition_cut, frequency_penalty=0.5))
                 if out:
                     return out
                 raise ModelError("empty caption")
@@ -152,7 +183,8 @@ class Indexer:
                     raise
                 log.warning("VLM gave no caption for %s (%s), retrying with a plain prompt", seg.key, e)
                 content[-1] = {"type": "text", "text": prompts.CAPTION_FALLBACK}
-                out = clean_text(vlm.chat([{"role": "user", "content": content}], max_tokens=max_tokens))
+                out = clean_text(vlm.generate([{"role": "user", "content": content}], max_tokens=max_tokens,
+                                              stop_on_repeat=repetition_cut, frequency_penalty=0.5))
                 if not out:
                     raise ModelError(f"VLM returned no caption for {seg.key}")
                 return out
@@ -162,7 +194,7 @@ class Indexer:
         if emb is None:
             z = np.zeros(1, np.float32)
             return z, z
-        text = f"{seg.caption}\n{seg.transcript}".strip() or "(empty)"
+        text = f"{seg.caption}\n{seg.ocr}\n{seg.transcript}".strip() or "(empty)"
         t = emb.embed_text(text, self.a.counter)
         frames = _even_pick(seg.frames, emb.max_images(len(seg.frames))) if seg.frames else []
         v = emb.embed_images([_b64_file(f) for f in frames]) if frames else t
@@ -185,7 +217,7 @@ class Indexer:
         from .query import Item
 
         s, engine, store = self.a.settings, self.a.engine, self.a.store
-        items = [Item(x.video, x.start, x.end, f"画面：{x.caption or '（无）'}\n语音：{x.transcript or '（无）'}",
+        items = [Item(x.video, x.start, x.end, segment_text(x),
                       thumb=x.frames[len(x.frames) // 2] if x.frames else "") for x in store.segments([name])]
 
         def chapter(group, level):
@@ -253,17 +285,17 @@ class Indexer:
             i = min(int(ts // s.segment_seconds), len(segments) - 1)
             segments[i].frames.append(f)
         audio = None
-        if self.a.asr.enabled and info["has_audio"]:
+        if self.a.perception.asr_enabled and info["has_audio"]:
             audio = media.extract_audio(path, os.path.join(vdir, "audio.pcm"))
-        report(0.05, f"抽帧 {len(frames)} 张，音频{'已提取' if audio is not None else '无/未启用 ASR'}")
+        report(0.05, f"抽帧 {len(frames)} 张；语音识别{'开启' if audio is not None else '关闭/无音轨'}；"
+                     f"文字识别（OCR）{'开启' if self.a.perception.ocr_enabled else '关闭'}")
 
         n = len(segments)
         text_vecs, vis_vecs = [None] * n, [None] * n
         chapter_budget = engine.group_budget(s.chapter_tokens)
 
         def item_of(seg):
-            return Item(seg.video, seg.start, seg.end,
-                        f"画面：{seg.caption or '（无）'}\n语音：{seg.transcript or '（无）'}",
+            return Item(seg.video, seg.start, seg.end, segment_text(seg),
                         thumb=seg.frames[len(seg.frames) // 2] if seg.frames else "")
 
         def chapter(group, level, frac=0.98):
@@ -276,14 +308,14 @@ class Indexer:
         with tempfile.TemporaryDirectory() as tmp, \
                 ThreadPoolExecutor(1) as asr_pool, ThreadPoolExecutor(1) as vlm_pool, \
                 ThreadPoolExecutor(1) as emb_pool, ThreadPoolExecutor(1) as llm_pool:
-            def do_caption(seg, asr_future):
-                seg.transcript = asr_future.result()
+            def do_caption(seg, perceive_future):
+                perceive_future.result()
                 report(0.05 + 0.95 * seg.index / n,
                        f"正在观看 {media.fmt_time(seg.start)}-{media.fmt_time(seg.end)}", seg, "watching")
                 seg.caption = self.caption(seg, seg.frames) if seg.frames else ""
                 return seg
 
-            asr_f = [asr_pool.submit(self._transcribe, audio, x, tmp) for x in segments]
+            asr_f = [asr_pool.submit(self._perceive, audio, x, tmp) for x in segments]
             cap_f = [vlm_pool.submit(do_caption, x, f) for x, f in zip(segments, asr_f)]
             emb_f = [emb_pool.submit(lambda f: self._embed(f.result()), f) for f in cap_f]
             chap_f, group, used = [], [], 0

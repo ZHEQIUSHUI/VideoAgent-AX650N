@@ -3,8 +3,13 @@
 CAPTION_FALLBACK = "请用简体中文描述这些画面。"
 
 
-def caption_prompt(start: str, end: str, n_frames: int, transcript: str) -> str:
-    speech = f"这段时间的语音转写为：「{transcript}」。\n" if transcript else ""
+def _context(transcript: str, ocr: str) -> str:
+    out = f"这段时间的语音转写为：「{transcript}」。\n" if transcript else ""
+    return out + (f"画面中识别到的文字：「{ocr}」。\n" if ocr else "")
+
+
+def caption_prompt(start: str, end: str, n_frames: int, transcript: str, ocr: str = "") -> str:
+    speech = _context(transcript, ocr)
     return (
         f"这是视频 {start} 到 {end} 之间按时间顺序抽取的 {n_frames} 帧画面。\n{speech}"
         "请用简体中文客观、具体地描述这段画面：场景与环境、人物（外貌、衣着、动作、表情）、"
@@ -12,8 +17,8 @@ def caption_prompt(start: str, end: str, n_frames: int, transcript: str) -> str:
     )
 
 
-def refine_prompt(start: str, end: str, n_frames: int, transcript: str, query: str) -> str:
-    speech = f"这段时间的语音转写为：「{transcript}」。\n" if transcript else ""
+def refine_prompt(start: str, end: str, n_frames: int, transcript: str, query: str, ocr: str = "") -> str:
+    speech = _context(transcript, ocr)
     return (
         f"这是视频 {start} 到 {end} 之间按时间顺序抽取的 {n_frames} 帧画面。\n{speech}"
         f"用户的问题是：「{query}」。\n"
@@ -23,13 +28,12 @@ def refine_prompt(start: str, end: str, n_frames: int, transcript: str, query: s
 
 
 ANSWER_SYSTEM = (
-    "你是视频内容问答助手。下面是从视频中检索到的片段资料，每条以 [编号] 开头并注明视频名和时间段，"
-    "包含画面描述和语音转写。\n"
-    "请只根据这些资料，用简体中文回答用户的问题：\n"
-    "- 引用资料时在句末标注对应编号，如 [1]、[2][3]；\n"
-    "- 按时间顺序组织内容；资料不足以回答时直接说明，不要编造；\n"
-    "- 直接给出答案，不要输出思考过程。\n\n"
-    "资料：\n{context}"
+    "你是视频问答助手。下面是从视频中找到的片段资料，每条以 [编号] 开头，注明视频名和时间段，"
+    "内容包括画面描述、画面中的文字和语音。\n\n"
+    "资料：\n{context}\n\n"
+    "回答要求：用简体中文，先直接回答问题，再说明出现在哪个视频的什么时间、依据是什么"
+    "（例如看到的招牌或字幕文字、听到的话），并在句末写上资料编号，如 [1]。"
+    "只根据资料回答；资料里没有相关内容时，回答“视频中没有找到相关内容”。不要只输出编号。"
 )
 
 

@@ -1,5 +1,0 @@
-# SenseVoice ASR server (servers/sensevoice_asr_server.py) — the HTTP server is stdlib
-numpy
-kaldi-native-fbank
-# pyaxengine: https://github.com/AXERA-TECH/pyaxengine/releases (preinstalled on AX650 board images)
-# ffmpeg on PATH for non-wav input

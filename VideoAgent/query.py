@@ -17,7 +17,7 @@ import numpy as np
 
 from . import media, prompts
 from .clients import ContextOverflow
-from .indexer import clean_text, repetition_cut as _repetition_cut
+from .indexer import clean_text, repetition_cut as _repetition_cut, segment_text as _segment_text
 from .store import Segment
 
 log = logging.getLogger("videoagent")
@@ -30,6 +30,35 @@ _FILLER_RE = re.compile(
     r"用?(简体|繁体)?(中文|英文|汉语)|请|帮我|给我|一下|这段|这个|这部|该|视频|画面|影片|片段|内容|场景|镜头|"
     r"里面?|中|的|了|吗|呢|吧|一|下|[，。？！?!,.\s]|"
     r"描述|概括|总结|总述|介绍|讲|说|什么|啥|发生|主要|大意|梗概|整体|整个|全部|全片", re.I)
+
+
+_QFILL_RE = re.compile(
+    r"请问|请|帮我|给我|一下|[哪那这]一?段|[哪那这]个|哪些|哪里|哪儿|什么时候|什么|何时|有没有|是否|是不是|出现|"
+    r"视频|画面|片段|镜头|场景|情况|内容|里面?|的|了|吗|呢|吧|有|在|是|[，。？！?!,.\s“”\"'：:、（）()]")
+
+
+def query_terms(query: str) -> list[str]:
+    """Content terms of a question: CJK bigrams of what remains after question words, plus latin words."""
+    terms = []
+    for chunk in _QFILL_RE.sub(" ", query).split():
+        for run in re.findall(r"[\u4e00-\u9fff]+", chunk):
+            terms += [run] if len(run) <= 2 else [run[i:i + 2] for i in range(len(run) - 1)]
+        terms += [w.lower() for w in re.findall(r"[A-Za-z0-9]{2,}", chunk)]
+    return list(dict.fromkeys(t for t in terms if len(t) >= 2))
+
+
+def lexical_scores(query: str, segs: list[Segment]) -> list[float]:
+    """Share of the question's terms found in each segment (on-screen text counts most)."""
+    terms = query_terms(query)
+    if not terms:
+        return [0.0] * len(segs)
+    out = []
+    for x in segs:
+        ocr, other = x.ocr.lower(), f"{x.caption}\n{x.transcript}".lower()
+        hit = sum(1.0 if t in ocr or t in other else 0.0 for t in terms)
+        bonus = 0.1 if any(t in ocr for t in terms) else 0.0
+        out.append(min(1.0, hit / len(terms) + bonus))
+    return out
 
 
 def is_global_question(query: str) -> bool:
@@ -57,10 +86,6 @@ class Item:
 
 def _thumb(seg: Segment) -> str:
     return seg.frames[len(seg.frames) // 2] if seg.frames else ""
-
-
-def _segment_text(seg: Segment, caption: str | None = None) -> str:
-    return f"画面：{caption if caption is not None else seg.caption or '（无）'}\n语音：{seg.transcript or '（无）'}"
 
 
 class QueryEngine:
@@ -171,11 +196,12 @@ class QueryEngine:
         sys_prompt = prompts.map_system(query, int(out_tokens * 0.8))
         ctx = "\n\n".join(it.text for it in group)  # already chronological; time tags get echoed back
         msgs = [{"role": "system", "content": sys_prompt}, {"role": "user", "content": ctx}]
+        kw = dict(max_tokens=out_tokens, stop_on_repeat=_repetition_cut, frequency_penalty=0.5)
         try:
-            text = llm.chat(msgs, max_tokens=out_tokens)
+            text = llm.generate(msgs, **kw)
         except ContextOverflow:
             msgs[1]["content"] = self.a.counter.truncate(ctx, int(self.group_budget(out_tokens, query) * 0.75))
-            text = llm.chat(msgs, max_tokens=out_tokens)
+            text = llm.generate(msgs, **kw)
         return Item(group[0].video, group[0].start, group[-1].end, clean_text(text), thumb=group[0].thumb)
 
     def _condense(self, query: str | None, items: list[Item], budget: int):
@@ -248,19 +274,28 @@ class QueryEngine:
             yield {**plan, "mode": mode}
         else:
             routed = self.a.embedder is None
-            if plan["global"] and routed:
-                ranked, hits = [], []  # global question: no need to ask the LLM where to look
-            else:
-                yield {"type": "status", "text": "让模型根据章节摘要定位相关片段..." if routed else "检索相关片段..."}
-                ranked = self._rank(query, names, segs)
-                hits = [(seg, sc) for seg, sc in ranked if sc >= s.score_threshold]
-                hits = hits if routed else hits[: s.top_k]  # routed: whole chapters, the budget trims them
+            method, ranked, hits = "", [], []
+            if not plan["global"]:
+                # 1) literal match of the question's key words (shop signs, names, subtitles, speech)
+                lex = lexical_scores(query, segs)
+                ranked = sorted(zip(segs, lex), key=lambda t: (-t[1], t[0].video, t[0].start))
+                hits = [(x, sc) for x, sc in ranked if sc >= 0.5][: s.top_k]
+                method = "keyword"
+                if not hits:
+                    # 2) vector retrieval, or without an embedding model: the LLM reads the chapter summaries
+                    method = "chapter" if routed else "vector"
+                    yield {"type": "status", "text": "关键词没有直接命中，让模型根据章节摘要判断相关片段..." if routed
+                           else "关键词没有直接命中，按语义相似度检索..."}
+                    ranked = self._rank(query, names, segs)
+                    hits = [(x, sc) for x, sc in ranked if sc >= s.score_threshold]
+                    hits = hits if routed else hits[: s.top_k]  # routed: whole chapters, the budget trims them
             mode = "summarize" if (plan["global"] or not hits) else "retrieve"
             yield {**plan, "mode": mode}
             if ranked:
-                yield {"type": "hits", "threshold": s.score_threshold, "used": mode == "retrieve", "routed": routed,
-                       "items": [Item(seg.video, seg.start, seg.end, seg.caption, sc, _thumb(seg)).as_dict()
-                                 for seg, sc in ranked[: max(s.top_k, 6)]]}
+                yield {"type": "hits", "method": method, "threshold": 0.5 if method == "keyword" else s.score_threshold,
+                       "used": mode == "retrieve", "routed": method == "chapter", "terms": query_terms(query),
+                       "items": [{**Item(x.video, x.start, x.end, x.caption, sc, _thumb(x)).as_dict(), "ocr": x.ocr,
+                                  "transcript": x.transcript} for x, sc in ranked[: max(s.top_k, 6)]]}
             if mode == "summarize":
                 pre = self._levels_for(names, budget)
                 if pre:
@@ -281,7 +316,7 @@ class QueryEngine:
                 items = []
                 for rank, (seg, sc) in enumerate(hits):
                     caption = None
-                    if rank < s.refine_top_n and seg.frames and not routed:
+                    if rank < s.refine_top_n and seg.frames and method == "vector":
                         yield {"type": "status", "text": f"VLM 重新观察片段 {media.fmt_time(seg.start)}-"
                                                          f"{media.fmt_time(seg.end)}..."}
                         try:
